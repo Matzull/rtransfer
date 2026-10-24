@@ -8,14 +8,19 @@ use std::io;
 
 use crate::protocol::Comp;
 
+/// Compressed output above this fraction of the input is not worth the
+/// receiver's decompression: the chunk goes raw (and `Comp::None` tells the
+/// sender the data is effectively incompressible).
+const MIN_SAVING: f64 = 0.97;
+
 /// Compress one chunk. Falls back to `Comp::None` when the data does not
-/// compress (the wire cost of the zstd frame dominates then).
+/// compress meaningfully (see [`MIN_SAVING`]).
 pub fn encode(buf: &[u8], comp: Comp) -> io::Result<(Comp, Vec<u8>)> {
     match comp {
         Comp::None => Ok((Comp::None, buf.to_vec())),
         Comp::Zstd(level) => {
             let out = zstd::bulk::compress(buf, level as i32)?;
-            if out.len() < buf.len() && !buf.is_empty() {
+            if !buf.is_empty() && (out.len() as f64) < buf.len() as f64 * MIN_SAVING {
                 Ok((comp, out))
             } else {
                 Ok((Comp::None, buf.to_vec()))
@@ -62,6 +67,16 @@ mod tests {
         let mut data = vec![0u8; 8192];
         crate::delta::fill_random(&mut data, 11);
         let (comp, out) = encode(&data, Comp::Zstd(9)).unwrap();
+        assert_eq!(comp, Comp::None);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn barely_compressible_goes_raw() {
+        // 98% random + 2% zeros: zstd saves ~2%, below the threshold.
+        let mut data = vec![0u8; 100_000];
+        crate::delta::fill_random(&mut data[..98_000], 12);
+        let (comp, out) = encode(&data, Comp::Zstd(3)).unwrap();
         assert_eq!(comp, Comp::None);
         assert_eq!(out, data);
     }

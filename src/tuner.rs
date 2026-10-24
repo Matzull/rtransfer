@@ -10,13 +10,13 @@
 //!   rounded up to 4 KiB, raised only if the signature (~20 B per block) would
 //!   cost more than ~1.5 s of the measured bandwidth. Small blocks find small
 //!   edits; adjacent matched blocks are coalesced into one `Copy` anyway.
-//! * **Compression** pays off only when the CPU can compress much faster than
-//!   the network consumes: zstd 3 with ≥2× CPU headroom (9 on slow links),
-//!   1 when tight, otherwise uncompressed (`Comp::None`).
+//! * **Compression** is not decided here: unless the user forces a codec, the
+//!   sender switches zstd 3 on and off at runtime by measured throughput
+//!   (see [`crate::compctl`]).
 //! * **Files in flight** scales with cores — multiple files overlap disk and
 //!   network latency with each other.
 
-use crate::bench::{CpuBench, zstd_speed_l3_l9};
+use crate::bench::CpuBench;
 use crate::protocol::Comp;
 
 /// All sizes are bytes unless noted.
@@ -29,7 +29,11 @@ pub struct Tuning {
     pub chunk: u64,
     /// Delta block size override; 0 = auto per file (see [`block_for`]).
     pub block: u64,
+    /// Codec to use: the forced one, or the level the runtime controller
+    /// toggles when [`Self::auto_comp`] is set.
     pub comp: Comp,
+    /// Compression left to the runtime controller (`--compression auto`).
+    pub auto_comp: bool,
 }
 
 /// Result of the bandwidth probe.
@@ -45,9 +49,10 @@ pub const MIN_CHUNK: u64 = 16 * 1024;
 pub const MAX_CHUNK: u64 = 1024 * 1024;
 pub const MIN_BLOCK: u64 = 4 * 1024;
 pub const MAX_BLOCK: u64 = 8 * 1024 * 1024;
-/// Below this (16 MiB/s ≈ 134 Mbit/s) the auto-picker may spend more CPU on
-/// compression (zstd 9) because every byte saved is worth more.
-pub const SLOW_LINK_BPS: f64 = 16.0 * 1024.0 * 1024.0;
+/// zstd level the runtime controller uses. Beyond 3 zstd buys little and
+/// costs a lot: on a real build tree (1 MiB chunks) L3 = 3.01x @ 320 MB/s,
+/// L9 = 3.13x @ 84, L16 = 3.24x @ 14 per core.
+pub const AUTO_ZSTD_LEVEL: i8 = 3;
 
 impl Tuning {
     /// Combine measurements and explicit user overrides (0 = auto).
@@ -60,8 +65,9 @@ impl Tuning {
         block_base_override: u64,
         comp_override: Option<Option<i8>>, // outer None = "auto"
     ) -> Tuning {
-        // Chunk: ~20 ms of network per frame.
-        let mut chunk = if net.bps > 0.0 { (0.02 * net.bps) as u64 } else { 256 * 1024 };
+        // Chunk: ~20 ms of network per frame when the bandwidth is known;
+        // otherwise the largest (cheapest per byte to frame and compress).
+        let mut chunk = if net.bps > 0.0 { (0.02 * net.bps) as u64 } else { MAX_CHUNK };
         chunk = chunk.clamp(MIN_CHUNK, MAX_CHUNK);
         if chunk_override > 0 {
             chunk = chunk_override.clamp(4 * 1024, 64 * MAX_CHUNK);
@@ -74,34 +80,9 @@ impl Tuning {
         // pipeline, so extra slots cost little CPU.
         let workers = workers.unwrap_or_else(|| (bench.cores * 2).clamp(8, 32));
 
-        // Compression level (auto).
-        let comp = match comp_override {
-            Some(user) => user.map_or(Comp::None, |l| Comp::Zstd(l as i8)),
-            None => {
-                let par = (bench.cores.saturating_sub(1)).max(1);
-                if net.bps == 0.0 {
-                    // Unknown network (e.g. stdio pipe): zstd-3 is the safe,
-                    // and widely-deployed, default.
-                    Comp::Zstd(3)
-                } else {
-                    // Beyond level 3 zstd buys little and costs a lot: on a
-                    // real build tree (1 MiB chunks) L3 = 3.01x @ 320 MB/s,
-                    // L9 = 3.13x @ 84, L16 = 3.24x @ 14 per core. So: L3 when
-                    // the CPU keeps 2x headroom; L9 only on slow links where
-                    // ~4% fewer bytes still matter; L1 or nothing when the CPU
-                    // cannot keep up. (Picking the *highest* affordable level
-                    // ran L16 on a LAN: 22x the CPU for 7% less data.)
-                    let fits = |l: i32, headroom: f64| zstd_speed_l3_l9(bench, l) * par as f64 >= headroom * net.bps;
-                    let pick = if fits(3, 2.0) {
-                        if net.bps < SLOW_LINK_BPS && fits(9, 2.0) { Some(9) } else { Some(3) }
-                    } else if fits(1, 1.2) {
-                        Some(1)
-                    } else {
-                        None
-                    };
-                    pick.map_or(Comp::None, |l| Comp::Zstd(l as i8))
-                }
-            }
+        let (comp, auto_comp) = match comp_override {
+            Some(user) => (user.map_or(Comp::None, Comp::Zstd), false),
+            None => (Comp::Zstd(AUTO_ZSTD_LEVEL), true),
         };
 
         // Delta block: explicit override, or 0 = auto per file (block_for).
@@ -117,6 +98,7 @@ impl Tuning {
             chunk,
             block,
             comp,
+            auto_comp,
         }
     }
 }
@@ -149,44 +131,35 @@ mod tests {
     use crate::bench::CpuBench;
 
     fn bench() -> CpuBench {
-        CpuBench { cores: 8, hash_bps: 2e9, zstd_l3_bps: 400e6, zstd_l9_bps: 120e6 }
+        CpuBench { cores: 8 }
     }
 
     #[test]
-    fn fast_network_skips_compression() {
-        // 12 GB/s: even level 1 across 8 cores (5.76 GB/s) falls below the
-        // 2× headroom rule — don't compress.
-        let t = Tuning::decide(&bench(), NetEst { bps: 1.2e10, rtt_s: 0.0002 }, 8, None, 0, 0, None);
-        assert_eq!(t.comp, Comp::None);
-        assert_eq!(t.chunk, MAX_CHUNK);
-        assert!(t.workers >= 2);
-        assert_eq!(t.links, 8);
+    fn auto_compression_is_left_to_the_runtime_controller() {
+        for net in [NetEst { bps: 1.2e10, rtt_s: 0.0002 }, NetEst { bps: 12e6, rtt_s: 0.02 }, NetEst::default()] {
+            let t = Tuning::decide(&bench(), net, 4, None, 0, 0, None);
+            assert!(t.auto_comp);
+            assert_eq!(t.comp, Comp::Zstd(AUTO_ZSTD_LEVEL));
+            assert_eq!(t.block, 0, "block size is auto (decided per file)");
+        }
     }
 
     #[test]
-    fn slow_network_gets_strong_compression() {
-        // 100 Mbit/s ≈ 12 MB/s: level 9 at 120 MB/s × 7 cores passes 2×.
+    fn chunk_follows_bandwidth_or_defaults_to_max() {
+        // ~20 ms of a 12 MB/s link ≈ 240 KB.
         let t = Tuning::decide(&bench(), NetEst { bps: 12e6, rtt_s: 0.02 }, 4, None, 0, 0, None);
-        assert!(matches!(t.comp, Comp::Zstd(l) if l >= 9));
-        // Chunk ~20ms×12MB/s = 240KB.
         assert!((64..=512).contains(&(t.chunk / 1024)));
-        // Block size is auto (decided per file).
-        assert_eq!(t.block, 0);
-    }
-
-    #[test]
-    fn lan_gets_cheap_compression() {
-        // A ~50 MB/s LAN (e.g. a small ARM board): plenty of CPU headroom, but levels above 3
-        // would burn many times the CPU for a few percent — stay at 3.
-        let t = Tuning::decide(&bench(), NetEst { bps: 50e6, rtt_s: 0.003 }, 4, None, 0, 0, None);
-        assert_eq!(t.comp, Comp::Zstd(3));
-    }
-
-    #[test]
-    fn unknown_network_defaults_zstd3() {
         let t = Tuning::decide(&bench(), NetEst::default(), 1, None, 0, 0, None);
-        assert!(matches!(t.comp, Comp::Zstd(3)));
+        assert_eq!(t.chunk, MAX_CHUNK);
         assert_eq!(t.links, 1);
+        assert!(t.workers >= 8);
+    }
+
+    #[test]
+    fn forced_none_disables_auto() {
+        let t = Tuning::decide(&bench(), NetEst::default(), 4, None, 0, 0, Some(None));
+        assert_eq!(t.comp, Comp::None);
+        assert!(!t.auto_comp);
     }
 
     #[test]
@@ -203,6 +176,7 @@ mod tests {
         assert_eq!(t.workers, 7);
         assert_eq!(t.chunk, 512 * 1024);
         assert!(matches!(t.comp, Comp::Zstd(5)));
+        assert!(!t.auto_comp);
         assert!(t.block >= 2 * 1024 * 1024);
     }
 

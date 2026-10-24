@@ -11,8 +11,9 @@ integrity checks.
   being read; same-size files are verified by hash.
 - **Parallel**: many files in flight at once, spread over several TCP links,
   with chunks compressed by zstd on all cores.
-- **Adaptive tuning**: at session start rtransfer measures CPU and bandwidth,
-  then picks chunk size, compression level and concurrency.
+- **Adaptive compression**: while transferring, the sender measures
+  throughput with zstd on and off and keeps whichever is faster. It skips
+  files that don't compress.
 - **Zero-install SSH**: if the remote has no `rtransfer`, the binary is staged
   into a temporary directory for the session and removed afterwards.
 - **Safe writes**: data goes to a part file and is checked against the
@@ -135,7 +136,7 @@ rtransfer push ./data tcp://server:7822/data
 |-------------------------------------|---------|----------------------------------------------------------|
 | `--links <n>`                       | 4       | Parallel TCP links per session                           |
 | `--workers <n>`                     | auto    | Files in flight                                          |
-| `--compression auto\|none\|zstd:<l>` | auto    | zstd level (auto: 3, 9 on slow links, off on fast ones)  |
+| `--compression auto\|none\|zstd:<l>` | auto    | auto: zstd 3, on only while it is faster           |
 | `--no-delta`                        | off     | Always send whole files                                  |
 | `--delete`                          | off     | Delete extraneous files on the receiver                  |
 | `--include` / `--exclude <glob>`    |         | Filters; can be repeated (includes are evaluated first)  |
@@ -149,6 +150,79 @@ rtransfer push ./data tcp://server:7822/data
 Run `rtransfer <command> --help` for the full list. Set `RUST_LOG=debug`
 for detailed logs; over SSH the remote side's log lines are shown with a
 `remote:` prefix.
+
+## Benchmarks
+
+rtransfer compared with `rsync` (daemon mode) and with `tar` streamed over a
+raw TCP socket (`socat`), with and without `zstd -1`. All tools use plain TCP
+on `127.0.0.1`, without SSH, so the numbers compare transfer engines rather
+than ciphers. The data is synthetic: half random bytes (incompressible) and
+half text (compresses about 3x). Every time is the median of 3 runs and
+includes a final `sync`. Every result was checked against the source with
+`diff -r`.
+
+Machine: AMD Ryzen 7 3700X (8 cores / 16 threads), NVMe SSD, Linux 7.2.
+Sender and receiver share the same CPU.
+
+**Many small files**: 10 000 files of 1–128 KiB (255 MiB), full-speed loopback.
+
+| Tool                  | Initial copy        | Re-sync, no changes |
+|-----------------------|--------------------:|--------------------:|
+| rtransfer             | 1.77 s (145 MiB/s)  | 0.14 s              |
+| rsync (daemon)        | 1.65 s (155 MiB/s)  | 0.14 s              |
+| tar \| socat          | 1.57 s (163 MiB/s)  | —                   |
+| tar \| zstd -1 \| socat | 1.63 s (156 MiB/s) | —                   |
+
+**A few big files**: 4 × 512 MiB (2 GiB), full-speed loopback.
+
+| Tool                  | Initial copy          | Re-sync, no changes |
+|-----------------------|----------------------:|--------------------:|
+| rtransfer             | 2.08 s (985 MiB/s)    | 0.01 s              |
+| rsync (daemon)        | 1.80 s (1,136 MiB/s)  | 0.06 s              |
+| tar \| socat          | 3.53 s (580 MiB/s)    | —                   |
+| tar \| zstd -1 \| socat | 4.16 s (493 MiB/s)   | —                   |
+
+**Slow link**: 2 000 small files + 2 × 64 MiB (178 MiB) through a
+50 Mbit/s link with 40 ms RTT, emulated by
+[`benches/transfer/shaper.py`](benches/transfer/shaper.py). The
+bandwidth limit is shared by all connections. "After edits" means
+1 MiB was overwritten in each big file and 1% of the small files grew.
+
+| Tool                  | Initial copy (on the wire) | Re-sync, no changes | Re-sync after edits |
+|-----------------------|---------------------------:|--------------------:|--------------------:|
+| rtransfer             | 22.1 s (127.8 MiB)         | 0.30 s (0.1 MiB)    | 1.24 s (2.5 MiB)    |
+| rsync (daemon)        | 30.8 s (179.1 MiB)         | 0.38 s (0.0 MiB)    | 0.96 s (2.2 MiB)    |
+| rsync -z (daemon)     | 21.0 s (120.9 MiB)         | —                   | 0.95 s (2.2 MiB)    |
+| tar \| socat          | 30.3 s (180.4 MiB)         | —                   | —                   |
+| tar \| zstd -1 \| socat | 21.8 s (128.5 MiB)       | —                   | —                   |
+
+What the numbers show:
+
+- **Compression adapts by itself.** The sender measures throughput with
+  compression on and off while it transfers, and keeps whichever is faster.
+  - On the slow link it compresses, which makes it 28% faster than plain
+    rsync and tar, and close to `rsync -z`.
+  - At full speed it doesn't, and stays within 7–15% of rsync.
+  - With the same defaults, `rsync -z` would slow down a fast link instead.
+- **No fixed cost per session.** rtransfer doesn't benchmark the CPU or probe
+  bandwidth before transferring, so an unchanged re-sync costs no more than
+  rsync's, and sends 0.1 MiB on the slow link.
+- **Still behind rsync:** the initial copy at full speed, by 7–15%, and
+  re-syncing small edits on the slow link, 1.24 s against 0.96 s. Batching many
+  small files per frame is the next step.
+
+Reproduce with:
+
+```sh
+cargo build --release
+benches/transfer/loopback.sh            # all scenarios; or: small | big | slow
+REPS=5 MBIT=20 RTT_MS=80 benches/transfer/loopback.sh slow
+```
+
+The test data is generated into `benches/transfer/data/` (about 2.5 GiB).
+Results, raw TSV plus a Markdown summary, go to `benches/transfer/results/`.
+`HOST=user@server RDIR=/srv/scratch benches/transfer/run.sh <dir>` runs a
+similar comparison over SSH against a real remote host.
 
 ## Contributing
 

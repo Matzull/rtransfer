@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use crate::compctl::{self, CompCtl};
 use crate::delta::{scan_for_delta, BlockSig, SigIndex};
 use crate::ioengine::{IoCtx, Reader};
 use crate::linkmux::Shared;
@@ -75,6 +76,37 @@ struct Pending {
     orig_len: u64,
     comp: Comp,
     data: Vec<u8>,
+    /// The original bytes when `data` is compressed (hashed at commit time
+    /// instead of decompressing `data` again); `None` when `data` is raw.
+    raw: Option<Vec<u8>>,
+}
+
+/// One file's view of the session codec: once a chunk of this file proved
+/// incompressible (media, archives), the rest of the file skips zstd.
+#[derive(Clone)]
+struct FileCodec {
+    ctl: Arc<CompCtl>,
+    incompressible: Arc<AtomicBool>,
+}
+
+impl FileCodec {
+    fn new(ctl: &Arc<CompCtl>) -> Self {
+        FileCodec { ctl: ctl.clone(), incompressible: Arc::default() }
+    }
+
+    fn pick(&self) -> Comp {
+        if self.incompressible.load(Ordering::Relaxed) {
+            Comp::None
+        } else {
+            self.ctl.current()
+        }
+    }
+
+    fn observe(&self, asked: Comp, got: Comp) {
+        if asked != Comp::None && got == Comp::None {
+            self.incompressible.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One splittable transfer work unit, indexed by `seq` position.
@@ -219,7 +251,7 @@ async fn chunk_job(
     reader: Arc<Reader>,
     offset: u64,
     len: u64,
-    comp: Comp,
+    codec: FileCodec,
     _permit: OwnedSemaphorePermit,
 ) -> std::io::Result<Pending> {
     let buf = reader.read_at(offset, len).await?;
@@ -229,8 +261,23 @@ async fn chunk_job(
             buf.len()
         )));
     }
-    let (comp, data) = chunk::encode(&buf, comp)?;
-    Ok(Pending { offset, orig_len: buf.len() as u64, comp, data })
+    let orig_len = buf.len() as u64;
+    let asked = codec.pick();
+    if asked == Comp::None {
+        return Ok(Pending { offset, orig_len, comp: Comp::None, data: buf, raw: None });
+    }
+    // zstd on 1 MiB takes milliseconds of CPU: keep it off the async
+    // workers, which also drive every link reader and writer.
+    let (comp, data, buf) = tokio::task::spawn_blocking(move || {
+        chunk::encode(&buf, asked).map(|(comp, data)| (comp, data, buf))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    codec.observe(asked, comp);
+    Ok(match comp {
+        Comp::None => Pending { offset, orig_len, comp, data: buf, raw: None },
+        _ => Pending { offset, orig_len, comp, data, raw: Some(buf) },
+    })
 }
 
 /// Send one parked chunk in order: hash the decoded bytes, then ship.
@@ -246,9 +293,7 @@ async fn commit_pending(
 ) -> Result<()> {
     let wire_len = pending.data.len() as u64;
     let orig_len = pending.orig_len;
-    let decoded = chunk::decode(pending.comp, orig_len, pending.data.clone())
-        .map_err(|e| anyhow::anyhow!("chunk {seq} decode: {e}"))?;
-    hasher.update(&decoded);
+    hasher.update(pending.raw.as_deref().unwrap_or(&pending.data));
     set.bus
         .send_data(Msg::Data {
             id,
@@ -274,7 +319,7 @@ async fn commit_pending(
 async fn send_whole(
     set: &Shared,
     ctx: &Arc<IoCtx>,
-    comp: Comp,
+    ctl: &Arc<CompCtl>,
     chunk_size: u64,
     entry: &FileEntry,
     path: &Path,
@@ -293,6 +338,7 @@ async fn send_whole(
     }
 
     let reader = Arc::new(Reader::open(ctx, path).await.context("open source file")?);
+    let codec = FileCodec::new(ctl);
     let mut js = JoinSet::<std::io::Result<(u64, Pending)>>::new();
     let mut hasher = blake3::Hasher::new();
     let mut parked: BTreeMap<u64, Pending> = BTreeMap::new();
@@ -319,8 +365,9 @@ async fn send_whole(
                     next_seq += 1;
                     let reader2 = reader.clone();
                     let off2 = offset;
+                    let codec2 = codec.clone();
                     js.spawn(async move {
-                        chunk_job(reader2, off2, len, comp, p)
+                        chunk_job(reader2, off2, len, codec2, p)
                             .await
                             .map(|s| (seq, s))
                     });
@@ -345,8 +392,9 @@ async fn send_whole(
                     next_seq += 1;
                     let reader2 = reader.clone();
                     let off2 = offset;
+                    let codec2 = codec.clone();
                     js.spawn(async move {
-                        chunk_job(reader2, off2, len, comp, p)
+                        chunk_job(reader2, off2, len, codec2, p)
                             .await
                             .map(|s| (seq, s))
                     });
@@ -394,7 +442,7 @@ async fn send_whole(
 async fn send_delta(
     set: &Shared,
     ctx: &Arc<IoCtx>,
-    comp: Comp,
+    ctl: &Arc<CompCtl>,
     chunk_size: u64,
     entry: &FileEntry,
     path: &Path,
@@ -489,6 +537,7 @@ async fn send_delta(
     }
 
     let reader = Arc::new(Reader::open(ctx, path).await.context("open source file")?);
+    let codec = FileCodec::new(ctl);
     let mut js = JoinSet::<std::io::Result<(u64, Pending)>>::new();
     let mut hasher = blake3::Hasher::new(); // literal-hash is informational only
     let mut parked: BTreeMap<u64, Pending> = BTreeMap::new();
@@ -522,8 +571,9 @@ async fn send_delta(
                         Ok(permit) => {
                             let seq = spawned;
                             let reader2 = reader.clone();
+                            let codec2 = codec.clone();
                             js.spawn(async move {
-                                chunk_job(reader2, off, len, comp, permit)
+                                chunk_job(reader2, off, len, codec2, permit)
                                     .await
                                     .map(|p| (seq, p))
                             });
@@ -551,8 +601,9 @@ async fn send_delta(
                         Item::Lit { off, len } => {
                             let seq = spawned;
                             let reader2 = reader.clone();
+                            let codec2 = codec.clone();
                             js.spawn(async move {
-                                chunk_job(reader2, off, len, comp, permit)
+                                chunk_job(reader2, off, len, codec2, permit)
                                     .await
                                     .map(|p| (seq, p))
                             });
@@ -628,7 +679,7 @@ pub async fn run_sender(
     // that in the transport setup; the server does it in the greeting).
     let links = set.bus.count().max(1) as u16;
 
-    let bench = tokio::task::spawn_blocking(|| crate::bench::bench_cpu(None)).await?;
+    let bench = crate::bench::cores_only();
     let (net, tuning) = crate::session::probe_and_tune(
         &set,
         d,
@@ -641,7 +692,11 @@ pub async fn run_sender(
         params.workers_override,
     )
     .await;
-    tracing::info!(net_mbps = net.bps / 1024.0 / 1024.0, ?tuning, "tuning decided");
+    tracing::info!(rtt_ms = net.rtt_s * 1000.0, ?tuning, "tuning decided");
+    let comp_ctl = Arc::new(match tuning.comp {
+        Comp::Zstd(level) if tuning.auto_comp => CompCtl::auto(level),
+        comp => CompCtl::fixed(comp),
+    });
 
     // The receiver validates the target before we push anything heavy.
     ensure_server_info(d, cancel).await?;
@@ -674,6 +729,15 @@ pub async fn run_sender(
         .send_control(&Msg::Manifest { files: entries.iter().map(|(e, _)| e.clone()).collect() })
         .await?;
     tracing::debug!("manifest sent: {total_files} files, {total_bytes} bytes");
+    // Runtime compression choice from delivered bytes; stops when dropped.
+    let _comp_sampler = compctl::spawn_sampler(
+        comp_ctl.clone(),
+        {
+            let stats = stats.clone();
+            move || stats.bytes_literal.load(Ordering::Relaxed)
+        },
+        cancel.clone(),
+    );
 
     let depth = pipeline_depth(links);
     let file_sem = Arc::new(Semaphore::new(tuning.workers.max(1) as usize));
@@ -801,7 +865,7 @@ pub async fn run_sender(
                     spawn_file_task(
                         &mut js, set.clone(), ctx.clone(), chunk_sem.clone(), stats.clone(),
                         progress.clone(), cancel.clone(), entry.clone(),
-                        path.clone(), action, block_len, blocks, tuning, net,
+                        path.clone(), action, block_len, blocks, tuning, net, comp_ctl.clone(),
                     );
                     break;
                 }
@@ -892,15 +956,16 @@ fn spawn_file_task(
     blocks: Vec<BlockSig>,
     tuning: Tuning,
     net: NetEst,
+    comp_ctl: Arc<CompCtl>,
 ) {
     js.spawn(async move {
         let pb = progress.file(&entry.rel, entry.size);
         tracing::debug!(id = entry.id, rel = %entry.rel, ?action, "file task start");
         let out = if action == PlanAction::Whole {
-            send_whole(&set, &ctx, tuning.comp, tuning.chunk, &entry, &path, &chunk_sem,
+            send_whole(&set, &ctx, &comp_ctl, tuning.chunk, &entry, &path, &chunk_sem,
                        &stats, pb.as_ref(), &cancel).await
         } else {
-            send_delta(&set, &ctx, tuning.comp, tuning.chunk, &entry, &path, block_len,
+            send_delta(&set, &ctx, &comp_ctl, tuning.chunk, &entry, &path, block_len,
                        blocks, &chunk_sem, &stats, pb.as_ref(), net, tuning, &cancel).await
         };
         if let Err(e) = &out {

@@ -224,7 +224,7 @@ pub async fn run_receiver(
         params.workers_override,
     )
     .await;
-    tracing::info!(net_mbps = net.bps / 1024.0 / 1024.0, ?tuning, "tuning decided");
+    tracing::info!(rtt_ms = net.rtt_s * 1000.0, ?tuning, "tuning decided");
 
     let io_ctx = IoCtx::new(params.io, tuning.chunk);
     let root = params.root.clone();
@@ -760,16 +760,23 @@ async fn apply_one(
 
     match frame {
         Frame::Data { offset, comp, orig_len, data } => {
-            let buf = chunk::decode(comp, orig_len, data)
-                .map_err(|e| format!("chunk decode at {offset}: {e}"))?;
+            let buf = match comp {
+                Comp::None => chunk::decode(comp, orig_len, data),
+                // Decompression is CPU work: off the async workers.
+                _ => tokio::task::spawn_blocking(move || chunk::decode(comp, orig_len, data))
+                    .await
+                    .map_err(|e| format!("chunk decode at {offset}: {e}"))?,
+            }
+            .map_err(|e| format!("chunk decode at {offset}: {e}"))?;
+            let len = buf.len() as u64;
             st.hasher.update(&buf);
-            st.content_len += buf.len() as u64;
+            st.content_len += len;
             writer
-                .write_at(offset, buf.clone())
+                .write_at(offset, buf)
                 .await
                 .map_err(|e| format!("write at {offset}: {e}"))?;
             if let Some(pb) = pb {
-                pb.inc(buf.len() as u64);
+                pb.inc(len);
             }
             Ok(())
         }

@@ -212,14 +212,20 @@ impl WriterBus {
         q.send(msg.clone()).await.context("control queue closed")
     }
 
-    /// Send one data-ish frame over any link, preferring the round-robin
+    /// Send one data-ish frame over a data link, preferring the round-robin
     /// next queue with room, falling back to blocking on one of them.
+    /// With more than one link, link 0 is left to control frames: plans and
+    /// results queued behind dozens of 1 MiB chunks would stall the whole
+    /// pipeline for seconds on a slow link.
     /// Takes the message by value: a refused `try_send` hands it back, so a
     /// 1 MiB `Data` frame is never copied on its way to a queue.
     pub async fn send_data(&self, msg: Msg) -> Result<()> {
-        let qs: Vec<WriterQ> = self.links.lock().unwrap().to_vec();
+        let mut qs: Vec<WriterQ> = self.links.lock().unwrap().to_vec();
         if qs.is_empty() {
             bail!("no links to send on");
+        }
+        if qs.len() > 1 {
+            qs.remove(0);
         }
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         let mut msg = msg;
@@ -549,6 +555,37 @@ mod tests {
         }
         set.bus.drain(Duration::from_secs(10)).await;
         assert_eq!(reader.await.unwrap(), 400, "frames lost at drain");
+    }
+
+    /// With several links, data frames never queue behind on the control link.
+    #[tokio::test]
+    async fn data_stays_off_the_control_link() {
+        let (set, _ctrl) = LinkSet::new(3, 16, 8);
+        let mut far = Vec::new();
+        for _ in 0..3 {
+            let (ours, theirs) = tokio::io::duplex(1 << 20);
+            set.bus.attach_writer(ours);
+            far.push(theirs);
+        }
+        for seq in 0..60u64 {
+            set.bus.send_data(Msg::Probe { seq, data: vec![0; 64] }).await.unwrap();
+        }
+        set.bus.send_control(&Msg::ProbeAck { seq: 0 }).await.unwrap();
+        set.bus.drain(Duration::from_secs(5)).await;
+        let mut counts = Vec::new();
+        for mut r in far {
+            let mut n = (0, 0);
+            while let Some(m) = frame::read_msg(&mut r).await.unwrap() {
+                match m {
+                    Msg::Probe { .. } => n.0 += 1,
+                    _ => n.1 += 1,
+                }
+            }
+            counts.push(n);
+        }
+        assert_eq!(counts[0], (0, 1), "control link carried data: {counts:?}");
+        assert_eq!(counts[1].0 + counts[2].0, 60);
+        assert!(counts[1].0 > 0 && counts[2].0 > 0, "data not spread: {counts:?}");
     }
 
     /// A closed control link must surface as a session error, not silence.

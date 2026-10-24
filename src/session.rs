@@ -390,8 +390,13 @@ async fn await_greeting(
     Ok(p2)
 }
 
-/// Bandwidth probe in the data direction + CPU bench + Tuning decision.
-/// `links` is the number of attached links (including control).
+/// Round-trip probe + Tuning decision. `links` is the number of attached
+/// links (including control).
+///
+/// Only one small probe: it measures the RTT and proves the data path works.
+/// Bandwidth is deliberately not probed (it cost 8-64 MiB per session and
+/// was too noisy to decide compression; that is now measured at runtime by
+/// [`crate::compctl`]), so the estimate's `bps` stays 0 = unknown.
 pub async fn probe_and_tune(
     set: &Shared,
     d: &Dispatcher,
@@ -403,75 +408,21 @@ pub async fn probe_and_tune(
     comp_override: Option<Option<i8>>,
     workers_override: Option<u32>,
 ) -> (NetEst, Tuning) {
-    let mut rtt_s = 0f64;
-    let mut bps = 0f64;
-    let mut seq = 0u64;
-    let sizes: [u64; 3] = [4096, 1024 * 1024, 8 * 1024 * 1024];
     // Hoisted guard: the probe acknowledgment queue belongs to this call.
     let mut probe_rx = d.probe_rx.lock().await;
-
-    for round in 0..sizes.len() {
-        let size = sizes[round];
-        let probes = if round == 0 { 1usize } else { links.max(1) as usize };
-        let t0 = std::time::Instant::now();
-        let mut acked = 0usize;
-        let mut sent = 0usize;
-        for _ in 0..probes {
-            seq += 1;
-            let msg = Msg::Probe { seq, data: vec![0u8; size as usize] };
-            if set.bus.send_data(msg).await.is_err() {
-                break;
-            }
-            sent += 1;
-        }
-        if sent == 0 {
-            // no probe got sent: dead link set
-            return (
-                NetEst { bps: 0.0, rtt_s: 0.0 },
-                Tuning::decide(bench, NetEst::default(), links, workers_override,
-                    chunk_override, block_base_override, comp_override),
-            );
-        }
-        let want = probes;
-        let per_probe_timeout = if round == 0 {
-            Duration::from_millis(2500)
-        } else {
-            Duration::from_secs(3)
-        };
-        let deadline = tokio::time::Instant::from_std(t0) + per_probe_timeout;
-        while acked < want {
-            tokio::select! {
-                ack = probe_rx.recv() => match ack {
-                    Some(Msg::ProbeAck { .. }) => {
-                        acked += 1;
-                    }
-                    _ => break,
-                },
-                _ = cancel.cancelled() => {
-                    let est = NetEst { bps, rtt_s };
-                    let tun = Tuning::decide(bench, est, links, workers_override, chunk_override,
-                        block_base_override, comp_override);
-                    return (est, tun);
+    let t0 = std::time::Instant::now();
+    let mut rtt_s = 0f64;
+    if set.bus.send_data(Msg::Probe { seq: 1, data: vec![0u8; 4096] }).await.is_ok() {
+        tokio::select! {
+            ack = probe_rx.recv() => {
+                if let Some(Msg::ProbeAck { .. }) = ack {
+                    rtt_s = t0.elapsed().as_secs_f64();
                 }
-                _ = tokio::time::sleep_until(deadline) => break,
             }
-        }
-        if acked == 0 {
-            break; // no acks at all: assume silence (conservative tuning)
-        }
-        let elapsed = t0.elapsed().as_secs_f64();
-        if round == 0 {
-            rtt_s = elapsed;
-            continue;
-        }
-        if acked == want {
-            bps = (acked as f64 * size as f64) / elapsed;
-        }
-        // Stop growing when this round already dominated the measurement.
-        if elapsed >= 0.05 || acked < want {
-            break;
+            _ = tokio::time::sleep(Duration::from_millis(2500)) => {}
+            _ = cancel.cancelled() => {}
         }
     }
-    let est = NetEst { bps, rtt_s };
+    let est = NetEst { bps: 0.0, rtt_s };
     (est, Tuning::decide(bench, est, links, workers_override, chunk_override, block_base_override, comp_override))
 }

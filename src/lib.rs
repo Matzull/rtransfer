@@ -11,6 +11,7 @@
 
 pub mod bench;
 pub mod chunk;
+pub mod compctl;
 pub mod cli;
 pub mod client;
 pub mod delta;
