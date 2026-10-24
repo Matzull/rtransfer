@@ -1,0 +1,19 @@
+[package]
+name = "serialization-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Compares wire codecs for rtransfer's Msg shapes (standalone; not part of the build)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+bincode = { version = "2", features = ["serde", "derive"] }
+bitcode = { version = "0.6", features = ["serde", "derive"] }
+postcard = { version = "1", features = ["alloc"] }
+rkyv = "0.8"
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

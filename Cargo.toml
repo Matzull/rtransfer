@@ -1,0 +1,79 @@
+[package]
+name = "rtransfer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fast multithreaded rsync/rclone-like file transfer tool with delta-sync, SSH and raw socket backends, and adaptive tuning."
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/rtransfer"
+readme = "README.md"
+keywords = ["rsync", "rclone", "transfer", "delta", "ssh"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+# Async runtime — the default backend. Multi-threaded scheduler everywhere.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "sync", "time", "macros", "signal", "io-std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# SSH backend (pure-Rust SSH2 implementation; ring backend keeps the build
+# dependency-light on every platform).
+russh = { version = "0.64", default-features = false, features = ["flate2", "rsa"] }
+
+# Encoding / framing
+serde = { version = "1", features = ["derive"] }
+# Bulk payloads as one byte string instead of serde's per-element sequence
+# (~50-80x faster encode/decode; identical bytes on the wire).
+serde_bytes = "0.11"
+bincode = { version = "2", features = ["serde"] }
+
+# Compression: Zstandard (libzstd, multithread enabled)
+zstd = { version = "0.14", features = ["zstdmt"] }
+
+# Hashing: BLAKE3 (SIMD, extremely fast) for signatures + end-to-end integrity.
+blake3 = "1"
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+
+# Errors
+anyhow = "1"
+
+# Logging / output
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = "0.18"
+rpassword = "7"
+
+# Walking & pattern matching
+walkdir = "2.5"
+globset = "0.4"
+
+# Misc
+rand = "0.9"
+rayon = "1"
+filetime = "0.2"
+
+# io_uring file IO backend (Linux only; used automatically when available).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.5"
+
+# Built-in CPU sampler (opt-in `profile` feature, Linux only; see main.rs).
+# Signal-based, so it works where `perf` is unavailable or locked down.
+pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
+
+[features]
+default = ["ring"]
+# `RTRANSFER_PROFILE=<prefix>` → <prefix>.svg flamegraph + <prefix>.txt top list.
+profile = ["dep:pprof"]
+# Crypto backends for russh. `ring` is a small, portable, self-contained build.
+ring = ["russh/ring"]
+# Alternatively build with the AWS-LC backend:
+aws-lc-rs = ["russh/aws-lc-rs"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.dev.package."*"]
+# Speed up hot dependencies even in debug builds (blake3 SIMD, zstd).
+opt-level = 2
